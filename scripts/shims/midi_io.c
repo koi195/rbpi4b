@@ -41,6 +41,7 @@
 
 #include "syscalls.h"
 #include "shimutil.h"
+#include "android_env.h"  /* ANDROID_BRIDGE: MIDI over FIFOs the app fills */
 #include "midi_io.h"
 #include "ctrl_map.h"    /* ctrl_abs_invalidate() */
 #include "controllers.h" /* the surface's own facts: hint, card, SysEx */
@@ -332,11 +333,153 @@ static void midi_connect_try(void)
      }
 }
 
+
+/* ---- ANDROID_BRIDGE: MIDI over two FIFOs ------------------------------------
+ *
+ * An unrooted Android app has no /dev/snd/seq and no rawmidi node, but it does
+ * have android.media.midi, which delivers a USB controller's bytes to the app.
+ * The app forwards them here, unchanged, through a FIFO; and whatever this shim
+ * wants to say back (LED notes, the FLX4 keepalive SysEx) goes out through a
+ * second one, which the app forwards to the controller.
+ *
+ *   in   ANDROID_MIDI_IN   raw MIDI stream, any chunking, running status allowed
+ *   out  ANDROID_MIDI_OUT  complete messages, one write() each
+ *
+ * The rest of the shim is untouched because the existing seams are exactly the
+ * right ones: `seq_fd` is "the thing the read loop polls" and the existing
+ * ROUTE_RAW output route is "write bytes to led_fd". Both are simply pointed at
+ * the FIFOs. The surface's name is a fixed string (ANDROID_MIDI_NAME, default
+ * "DDJ-FLX4") because on this route there is no port list to read it from, and
+ * controllers_by_hint() needs a name to pick the controller table row, LED map
+ * and keepalive from.
+ *
+ * Only the three event kinds the maps consume (note on, note off, control change)
+ * are decoded; everything else in the stream is skipped without losing sync. */
+static int android_midi_active;
+
+static int android_seq_setup(void)
+{
+     const char *in  = android_env("ANDROID_MIDI_IN",  ANDROID_MIDI_IN_DEFAULT);
+     const char *out = android_env("ANDROID_MIDI_OUT", ANDROID_MIDI_OUT_DEFAULT);
+     int fd = real_open(in, O_RDWR, 0);     /* RDWR: never sees EOF; see pointsrc.c */
+
+     if (fd < 0) {
+          klog("knobshim2: android: open %s failed: %s\n", in, strerror(errno));
+          return 0;
+     }
+     seq_fd = fd;
+     /* Non-blocking: a stalled app must never stall the LED/meter threads. A full
+      * FIFO simply drops that message, which for an LED is the right behaviour. */
+     led_fd = real_open(out, O_RDWR | O_NONBLOCK, 0);
+     if (led_fd >= 0) {
+          out_route = ROUTE_RAW;
+          snprintf(surface_name, sizeof surface_name, "%s",
+                   android_env("ANDROID_MIDI_NAME", "DDJ-FLX4"));
+          klog("knobshim2: android: MIDI in %s, out %s, surface '%s'\n",
+               in, out, surface_name);
+     } else {
+          klog("knobshim2: android: open %s failed: %s (input only)\n",
+               out, strerror(errno));
+     }
+     android_midi_active = 1;
+     return 1;
+}
+
+static void android_midi_dispatch(void (*on_event)(const struct snd_seq_event *),
+                                  unsigned char status, const unsigned char *d)
+{
+     struct snd_seq_event ev;
+
+     memset(&ev, 0, sizeof ev);
+     ev.flags = SNDRV_SEQ_EVENT_LENGTH_FIXED;
+     switch (status & 0xf0) {
+     case 0x90:
+          ev.type = SNDRV_SEQ_EVENT_NOTEON;
+          ev.data.note.channel = status & 0x0f;
+          ev.data.note.note = d[0];
+          ev.data.note.velocity = d[1];
+          break;
+     case 0x80:
+          ev.type = SNDRV_SEQ_EVENT_NOTEOFF;
+          ev.data.note.channel = status & 0x0f;
+          ev.data.note.note = d[0];
+          ev.data.note.velocity = d[1];
+          break;
+     case 0xb0:
+          ev.type = SNDRV_SEQ_EVENT_CONTROLLER;
+          ev.data.control.channel = status & 0x0f;
+          ev.data.control.param = d[0];
+          ev.data.control.value = d[1];
+          break;
+     default:
+          return;
+     }
+     on_event(&ev);
+}
+
+/* MIDI byte-stream parser: status + running status, realtime bytes ignored
+ * wherever they appear, SysEx and system-common skipped. */
+static void android_midi_poll(void (*on_event)(const struct snd_seq_event *ev))
+{
+     unsigned char buf[512];
+     unsigned char status = 0, data[2] = { 0, 0 };
+     int need = 0, have = 0, in_sysex = 0;
+
+     for (;;) {
+          struct pollfd pfd;
+          ssize_t n;
+
+          pfd.fd = seq_fd;
+          pfd.events = POLLIN;
+          if (poll(&pfd, 1, 1000) <= 0)
+               continue;
+          n = real_read(seq_fd, buf, sizeof buf);
+          if (n < 0) {
+               if (errno != EINTR && errno != EAGAIN)
+                    usleep(100000);
+               continue;
+          }
+          for (ssize_t i = 0; i < n; i++) {
+               unsigned char b = buf[i];
+
+               if (b >= 0xf8)
+                    continue;                      /* realtime: ignore, keep state */
+               if (b & 0x80) {
+                    if (b == 0xf0) {
+                         in_sysex = 1; status = 0; have = 0;
+                    } else if (b == 0xf7) {
+                         in_sysex = 0;
+                    } else if (b >= 0xf1) {
+                         status = 0; have = 0;     /* system common: not decoded */
+                    } else {
+                         in_sysex = 0;
+                         status = b; have = 0;
+                         need = ((b & 0xf0) == 0xc0 || (b & 0xf0) == 0xd0) ? 1 : 2;
+                    }
+               } else if (in_sysex || !status) {
+                    continue;
+               } else {
+                    data[have++] = b;
+                    if (have == need) {
+                         if (need == 2)
+                              android_midi_dispatch(on_event, status, data);
+                         have = 0;                 /* running status persists */
+                    }
+               }
+          }
+     }
+}
+
 void seq_setup(void)
 {
      struct snd_seq_client_info cinfo;
      struct snd_seq_port_info pinfo;
      int ver;
+
+     if (android_mode()) {
+          android_seq_setup();
+          return;
+     }
 
      seq_fd = real_open(SEQ_DEV, O_RDWR | O_NONBLOCK, 0);
      if (seq_fd < 0) {
@@ -411,6 +554,11 @@ void midi_poll_forever(void (*on_event)(const struct snd_seq_event *ev))
      /* Rate limit for the "this fd is not usable" line below. Static rather than
       * automatic because it has to survive the round it was set in. */
      static unsigned long long seq_bad_next_ms;
+
+     if (android_midi_active) {
+          android_midi_poll(on_event);          /* does not return */
+          return;
+     }
 
      for (;;) {
           struct pollfd pfd;

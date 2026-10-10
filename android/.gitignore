@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+# proot is fetched by scripts/android/fetch-proot.sh (GPL; not vendored here)
+app/src/main/jniLibs/

@@ -390,6 +390,36 @@ fbshim.so: $(FBSHIM_OBJS) rbp_key.o fader_state.o rbp_transport.o \
 	$(CC) $(CFLAGS) -shared -o $@ $(FBSHIM_OBJS) rbp_key.o fader_state.o \
 	    rbp_transport.o -lpthread -lm -lc $(LDFLAGS)
 
+# --- Android build of fbshim ------------------------------------------------
+# fbshim-android.so is fbshim.so plus android_bridge.o: the interposed syscall()
+# that turns /dev/fb0 into a MAP_SHARED file the Android app draws (see
+# android_bridge.c). It is a SEPARATE artifact on purpose -- the Pi's verified
+# fbshim.so does not change by a single byte, and a `syscall` interposer is not
+# something to ship to a target that does not need it. The Android bundle installs
+# it as usr/lib/fbshim.so inside the chroot (scripts/android/build-bundle.sh).
+#
+# -ldl: android_bridge.c forwards everything it does not handle through
+# dlsym(RTLD_NEXT, "syscall"), pinned to GLIBC_2.4 like netshim's dlsym.
+fbshim-android.so: $(FBSHIM_OBJS) android_bridge.o rbp_key.o fader_state.o \
+           rbp_transport.o $(FBSHIM_HDRS) rbp_transport.h android_env.h \
+           $(COMPAT)/libc_nonshared.a $(COMPAT)/libpthread_nonshared.a
+	$(CC) $(CFLAGS) -shared -o $@ $(FBSHIM_OBJS) android_bridge.o rbp_key.o \
+	    fader_state.o rbp_transport.o -lpthread -lm -ldl -lc $(LDFLAGS)
+
+android_bridge.o: android_bridge.c android_env.h fbdev.h
+pointsrc.o: android_env.h
+midi_io.o: android_env.h
+
+# Host-compiler sanity check of the one new C file: no cross toolchain needed, so it
+# runs anywhere. It proves the file compiles warning-free; it does not run the player.
+.PHONY: android-check
+android-check:
+	gcc -Wall -Wextra -fsyntax-only -I. android_bridge.c
+
+.PHONY: android
+android: fbshim-android.so knobshim.so audioshim.so crashcatch.so
+	@echo "android: built fbshim-android.so knobshim.so audioshim.so crashcatch.so"
+
 fb_shim.o: fb_shim.c pointsrc.h $(FBSHIM_HDRS)
 tscfake.o: tscfake.c tscfake.h pointsrc.h
 # An interposer has to look at the arguments it is handed — that is the job — so

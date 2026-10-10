@@ -29,6 +29,7 @@
 #include "hc_zone.h"
 #include "syscalls.h"
 #include "envutil.h"
+#include "android_env.h"   /* ANDROID_BRIDGE: the touch screen is a FIFO of evdev records */
 #include "usb_label.h"   /* what a media device's name may contain -- the same rules
                           * knobshim writes into rbp's own device record with */
 
@@ -2604,6 +2605,49 @@ static int open_pointer(int *kind_out, char *path_out, unsigned long path_len,
     return -1;
 }
 
+/* ANDROID_BRIDGE: the tablet's screen reaches the player as a FIFO of ordinary
+ * Linux input_event records -- the same struct read_loop_abs() reads from a real
+ * /dev/input/event*. The Android app writes ABS_MT_SLOT / ABS_MT_TRACKING_ID /
+ * ABS_MT_POSITION_X/Y / ABS_X / ABS_Y / BTN_TOUCH / SYN_REPORT, already scaled
+ * into the 1280x800 logical space, so everything downstream of the read -- the
+ * menu, the edge drawers (two-finger faders), the QUANTIZE boxes, the Beat FX
+ * panel -- runs unchanged. Nothing here knows about Android except where the bytes
+ * come from.
+ *
+ * Opened O_RDWR on purpose: the shim then holds a writer itself, so the FIFO never
+ * reports EOF when the app's end closes (an app restart would otherwise look like
+ * "device gone" to read_loop_abs and send it round the rediscovery loop). It is
+ * left BLOCKING because read_loop_abs treats EAGAIN as "try again" and would spin.
+ *
+ * The EVIOCGABS ioctls read_loop_abs() makes on it fail with ENOTTY, which both
+ * callers already treat as "keep the default" -- and the defaults are replaced
+ * below by an identity transform, so the range is not read from the device. */
+static int open_android_touch(char *path_out, unsigned long path_len,
+                              char *name_out, unsigned long name_len)
+{
+    const char *p = android_env("ANDROID_TOUCH_FIFO", ANDROID_TOUCH_FIFO_DEFAULT);
+    int fd = real_open(p, O_RDWR, 0);
+
+    if (fd < 0)
+        return -1;
+    snprintf(path_out, path_len, "%s", p);
+    snprintf(name_out, name_len, "Android touch bridge");
+    return fd;
+}
+
+static void android_xform(struct point_xform *x)
+{
+    point_xform_init(x);
+    /* The app already sends logical coordinates: identity, whatever POINT_* said. */
+    x->swap_xy = 0;
+    x->invert_x = 0;
+    x->invert_y = 0;
+    x->raw_min_x = 0;
+    x->raw_max_x = POINT_LOGICAL_W - 1;
+    x->raw_min_y = 0;
+    x->raw_max_y = POINT_LOGICAL_H - 1;
+}
+
 static void *reader_thread(void *arg)
 {
     (void)arg;
@@ -2615,7 +2659,12 @@ static void *reader_thread(void *arg)
 
         path[0] = '\0';
         name[0] = '\0';
-        fd = open_pointer(&kind, path, sizeof path, name, sizeof name);
+        if (android_mode()) {
+            fd = open_android_touch(path, sizeof path, name, sizeof name);
+            kind = POINT_KIND_ABS;
+        } else {
+            fd = open_pointer(&kind, path, sizeof path, name, sizeof name);
+        }
         if (fd < 0) {
             /* Nothing attached, or what is attached is not a pointer. Retry
              * forever rather than exiting: plugging a mouse in later has to
@@ -2631,7 +2680,10 @@ static void *reader_thread(void *arg)
 
         {
             struct point_xform x;
-            absorb_into_xform(&x, fd, kind);
+            if (android_mode())
+                android_xform(&x);
+            else
+                absorb_into_xform(&x, fd, kind);
             if (kind == POINT_KIND_ABS)
                 read_loop_abs(fd, &x);
             else
